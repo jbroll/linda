@@ -14,6 +14,34 @@ This repository contains minimal file-based implementations of the Linda tuple s
 - Locking is done via atomic file creation with PID checking and timeout handling
 - Tuple contents are opaque bytes or text — no serialization or specific data format is enforced
 
+## Lock-Free Design (Tcl Implementation)
+
+The Tcl implementation uses a mostly lock-free design for maximum performance and concurrency:
+
+### Lock-Free Operations
+
+- **Reads (`inp`/`rd`)**: Use atomic filesystem operations. If a file is removed between `glob` and `open`, the operation retries with a fresh directory listing. Once a file handle is obtained, the file contents remain stable even if another process removes the file.
+
+- **Writes (`out`)**: Use atomic write-then-rename semantics. Each write creates a unique temporary file, writes the data, then atomically renames it to the final filename.
+
+- **Tuple consumption (`inp`)**: After reading a tuple, attempts to remove the file. If removal fails (another process consumed it), that's acceptable since we already have the data.
+
+### Locking Used Only For
+
+- **Sequence number generation**: The `seq` flag requires coordinated sequence numbering, so file-based locking is used only for the sequence file.
+
+### Replacement Semantics Limitation
+
+**IMPORTANT**: Mixing `out name data` (normal) and `out name data rep` (replacement) for the same tuple name results in **undefined behavior**.
+
+- Normal `out` creates files like `name-XXXXXXXX` (with random suffix)
+- Replacement `out rep` creates files like `name` (no suffix)
+- A `rd` or `inp` operation might return data from either file type
+
+**Recommendation**: Use replacement semantics (`rep`) only for singleton tuples where you want exactly one value to exist. Do not mix `rep` with other `out` operations on the same tuple name.
+
+This design choice preserves the performance benefits of lock-free operation while acknowledging the semantic limitation.
+
 ## Python API (linda.py)
 
 ### Functions
@@ -75,16 +103,16 @@ linda.sh clear
 
 ### Commands
 
-- `linda::out name data ?ttl?`
-- `linda::inp namePattern ?timeout?`
-- `linda::rd namePattern`
-- `linda::ls ?namePattern?`
+- `linda out name data ?ttl?`
+- `linda inp namePattern ?timeout?`
+- `linda rd namePattern ?timeout?`
+- `linda ls ?namePattern?`
 
 ### Command Descriptions
 
 - **out**: Write tuple data (string), optional TTL seconds
 - **inp**: Blocking read-and-remove, optional timeout in seconds or `once` keyword for non-blocking
-- **rd**: Blocking read without removal
+- **rd**: Blocking read without removal, optional timeout in seconds or `once` keyword for non-blocking  
 - **ls**: List matching tuples
 
 ## Implementation Notes
@@ -94,3 +122,4 @@ linda.sh clear
 - Expired tuples are cleaned automatically on each API invocation
 - Tuple data is treated as opaque content; no serialization enforced
 - Shell implementation supports sequence numbering for FIFO semantics and replacement semantics
+- Tcl implementation uses mostly lock-free design with documented limitations for mixed operation types
