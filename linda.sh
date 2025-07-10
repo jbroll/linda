@@ -24,7 +24,7 @@ if filelock "cleanup"; then
   trap 'rm -f "$TUPLEDIR/.lock.cleanup" "$TUPLEDIR/.lock.cleanup.pid"' EXIT
   now=$(date +%s)
 
-  for file in "$TUPLEDIR"/*.json; do
+  for file in "$TUPLEDIR"/*; do
     [[ -e "$file" ]] || continue
     exp=$(echo "$file" | awk -F. '{print $(NF-2)}')
     [[ "$exp" =~ ^[0-9]+$ ]] || continue
@@ -39,7 +39,7 @@ fi
 usage() {
   echo "Usage:"
   echo "  echo '{...}' | $0 out name [ttl_seconds]"
-  echo "  $0 in name-or-pattern [once|timeout]"
+  echo "  $0 inp name-or-pattern [once|timeout]"
   echo "  $0 rd name-or-pattern"
   echo "  $0 ls [name-or-pattern]"
   exit 1
@@ -66,13 +66,13 @@ case "$op" in
       expiry=0
     fi
     rand=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
-    file="$TUPLEDIR/$pattern.$expiry.$rand.json"
+    file="$TUPLEDIR/$pattern.$expiry.$rand"
     tmp=$(mktemp "$TUPLEDIR/tmp.$pattern.XXXXXX") || exit 1
     cat > "$tmp"
     mv "$tmp" "$file"
     ;;
 
-  in)
+  inp)
     [[ -z "$pattern" ]] && usage
     shopt -s nullglob
 
@@ -92,7 +92,7 @@ case "$op" in
 
     start_time=$(date +%s)
     while true; do
-      for file in "$TUPLEDIR"/$pattern*.json; do
+      for file in "$TUPLEDIR"/$pattern*; do
         is_expired "$file" && continue
         lock="$file.lock"
         if ln "$file" "$lock" 2>/dev/null; then
@@ -120,7 +120,7 @@ case "$op" in
     [[ -z "$pattern" ]] && usage
     shopt -s nullglob
     while true; do
-      for file in "$TUPLEDIR"/$pattern*.json; do
+      for file in "$TUPLEDIR"/$pattern*; do
         is_expired "$file" && continue
         lock="$file.lock"
         if ln "$file" "$lock" 2>/dev/null; then
@@ -136,7 +136,7 @@ case "$op" in
   ls)
     shopt -s nullglob
     pat="${pattern:-*}"
-    for file in "$TUPLEDIR"/$pat*.json; do
+    for file in "$TUPLEDIR"/$pat*; do
       is_expired "$file" && continue
       basename "$file"
     done
