@@ -89,6 +89,74 @@ hex() {
     echo "$prefix$rand"
 }
 
+# === Internal function to attempt reading a tuple once ===
+_try_read_tuple() {
+    local name="$1"
+    local consume="$2"  # 0 or 1
+    local retry_count=0
+    
+    while [ "$retry_count" -lt 2 ]; do
+        local found_any=0
+        
+        for f in "$TUPPLEDIR/$name"*; do
+            found_any=1
+            
+            # Try to read the file
+            if cat "$f" 2>/dev/null; then
+                if [ "$consume" = "consume" ]; then
+                    rm -f "$f"
+                fi
+                return 0
+            fi
+            # File disappeared between glob and cat, continue to next file
+        done
+        
+        if [ "$found_any" -eq 0 ]; then
+            return 1  # No files matched the pattern
+        fi
+        
+        # All files in this glob disappeared, try one immediate re-glob
+        retry_count=$((retry_count + 1))
+    done
+    
+    return 1  # Give up after 2 attempts
+}
+
+# === Internal function to handle waiting/timeout logic ===
+_wait_for_tuple() {
+    local name="$1"
+    local consume="$2"     # 0 or 1
+    local mode="${3:-wait}" # wait | once | timeout_seconds
+    
+    local timeout=0
+    local deadline=0
+    local now
+    
+    if [[ "$mode" == "once" ]]; then
+        timeout=0
+    elif [[ "$mode" =~ ^[0-9]+$ ]]; then
+        now=$(date +%s)
+        deadline=$((now + mode))
+        timeout=1
+    fi
+
+    while :; do
+        if _try_read_tuple "$name" "$consume"; then
+            return 0
+        fi
+
+        if [[ "$mode" == "once" ]]; then
+            return 1
+        elif [ "$timeout" -eq 1 ]; then
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+                return 1
+            fi
+        fi
+        sleep 0.1
+    done
+}
+
 # === Command: out ===
 cmd_out() {
     local name="$1"; shift
@@ -128,49 +196,18 @@ cmd_out() {
     mv "$tmp" "$fname"
 }
 
-# === Command: in / inp ===
+# === Command: inp (consume) ===
 cmd_inp() {
     local name="$1"
-    local mode="${2:-wait}"  # wait | once | N (timeout)
-
-    local timeout=0
-    local deadline=0
-    local now
-    if [[ "$mode" == "once" ]]; then
-        timeout=0
-    elif [[ "$mode" =~ ^[0-9]+$ ]]; then
-        now=$(date +%s)
-        deadline=$((now + mode))
-        timeout=1
-    fi
-
-    while :; do
-        for f in "$TUPPLEDIR/$name"*; do
-            cat "$f"
-            rm -f "$f"
-            return 0
-        done
-
-        if [ "$mode" == "once" ]; then
-            return 1
-        elif [ "$timeout" -eq 1 ]; then
-            now=$(date +%s)
-            if [ "$now" -ge "$deadline" ]; then
-                return 1
-            fi
-        fi
-        sleep 0.1
-    done
+    local mode="${2:-wait}"
+    _wait_for_tuple "$name" consume "$mode"
 }
 
-# === Command: rd ===
+# === Command: rd (read without consuming) ===
 cmd_rd() {
     local name="$1"
-    for f in "$TUPPLEDIR/$name"*; do
-        cat "$f"
-        return 0
-    done
-    return 1
+    local mode="${2:-wait}"
+    _wait_for_tuple "$name" read "$mode"
 }
 
 cmd_ls() {
@@ -199,5 +236,5 @@ case "$cmd" in
     rd)    cmd_rd "$@" ;;
     ls)    cmd_ls "$@" ;;
     clear) cmd_clear ;;
-    *) echo "Usage: $0 {out|in|rd|ls|clear} ..." >&2; exit 1 ;;
+    *) echo "Usage: $0 {out|inp|rd|ls|clear} ..." >&2; exit 1 ;;
 esac
