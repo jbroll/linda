@@ -150,4 +150,4 @@ def ls(pattern):
     return matches
 
 
-once = -1
+onnce = -1

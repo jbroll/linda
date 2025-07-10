@@ -1,148 +1,191 @@
 #!/bin/bash
-# linda.sh - Minimal Linda tuple space using files, TTL, native locking, and in-timeout
 
-TUPLEDIR="${LINDA_DIR:-/tmp/linda}"
-LOCKFILE="$TUPLEDIR/.lock.cleanup"
+set -euo pipefail
 
-mkdir -p "$TUPLEDIR"
+# Enable nullglob so globs that match nothing expand to zero words
+shopt -s nullglob
 
-# --- File-based lock function ---
+# === Configuration ===
+TUPPLEDIR="${LINDA_DIR:-/tmp/linda}"
+LOCKEXT=".lock"
+LOCK_TIMEOUT=5  # seconds to wait for lock before giving up
+
+# === Locking with PID check and timeout ===
 filelock() {
-  local name="$1"
-  local lockfile="$TUPLEDIR/.lock.$name"
-  # Try atomic link for lock
-  if ln "$0" "$lockfile" 2>/dev/null; then
-    echo "$$" > "$lockfile.pid"
-    return 0
-  else
-    return 1
-  fi
-}
+    local lockname="$1"
+    local lockpath="$TUPPLEDIR/$lockname$LOCKEXT"
+    local start now pid
 
-# --- Cleanup expired tuples if we get the lock ---
-if filelock "cleanup"; then
-  trap 'rm -f "$TUPLEDIR/.lock.cleanup" "$TUPLEDIR/.lock.cleanup.pid"' EXIT
-  now=$(date +%s)
-
-  for file in "$TUPLEDIR"/*; do
-    [[ -e "$file" ]] || continue
-    exp=$(echo "$file" | awk -F. '{print $(NF-2)}')
-    [[ "$exp" =~ ^[0-9]+$ ]] || continue
-    [[ "$exp" == "0" ]] && continue
-    if [[ "$now" -ge "$exp" ]]; then
-      rm -f "$file" "$file.lock"
-    fi
-  done
-fi
-
-# --- Helper functions ---
-usage() {
-  echo "Usage:"
-  echo "  echo '{...}' | $0 out name [ttl_seconds]"
-  echo "  $0 inp name-or-pattern [once|timeout]"
-  echo "  $0 rd name-or-pattern"
-  echo "  $0 ls [name-or-pattern]"
-  exit 1
-}
-
-is_expired() {
-  local fname="$1"
-  local exp=$(echo "$fname" | awk -F. '{print $(NF-2)}')
-  [[ "$exp" == "0" ]] && return 1
-  [[ "$(date +%s)" -ge "$exp" ]]
-}
-
-# --- Main command dispatch ---
-op="$1"
-pattern="$2"
-third="$3"
-
-case "$op" in
-  out)
-    [[ -z "$pattern" ]] && usage
-    if [[ "$third" =~ ^[0-9]+$ && "$third" -gt 0 ]]; then
-      expiry=$(( $(date +%s) + third ))
-    else
-      expiry=0
-    fi
-    rand=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
-    file="$TUPLEDIR/$pattern.$expiry.$rand"
-    tmp=$(mktemp "$TUPLEDIR/tmp.$pattern.XXXXXX") || exit 1
-    cat > "$tmp"
-    mv "$tmp" "$file"
-    ;;
-
-  inp)
-    [[ -z "$pattern" ]] && usage
-    shopt -s nullglob
-
-    mode="block"
-    timeout=0
-
-    if [[ -n "$third" ]]; then
-      if [[ "$third" == "once" ]]; then
-        mode="once"
-      elif [[ "$third" =~ ^[0-9]+$ ]]; then
-        mode="timeout"
-        timeout=$third
-      else
-        usage
-      fi
-    fi
-
-    start_time=$(date +%s)
+    start=$(date +%s)
     while true; do
-      for file in "$TUPLEDIR"/$pattern*; do
-        is_expired "$file" && continue
-        lock="$file.lock"
-        if ln "$file" "$lock" 2>/dev/null; then
-          cat "$file"
-          rm -f "$file" "$lock"
-          exit 0
+        if ( set -o noclobber; echo "$$" > "$lockpath" ) 2>/dev/null; then
+            return 0  # Lock acquired
         fi
-      done
 
-      if [[ "$mode" == "once" ]]; then
-        exit 1
-      elif [[ "$mode" == "timeout" ]]; then
+        if [ -f "$lockpath" ]; then
+            pid=$(cat "$lockpath" 2>/dev/null || echo "")
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    rm -f "$lockpath"
+                    echo "Removed stale lock held by PID $pid" >&2
+                    continue
+                fi
+            else
+                rm -f "$lockpath"
+                echo "Removed corrupt lock file" >&2
+                continue
+            fi
+        fi
+
+        sleep 0.05
         now=$(date +%s)
-        elapsed=$((now - start_time))
-        if (( elapsed >= timeout )); then
-          exit 1
+        if (( now - start >= LOCK_TIMEOUT )); then
+            echo "Timeout acquiring lock $lockpath" >&2
+            return 1
         fi
-      fi
-
-      sleep 0.1
     done
-    ;;
+}
 
-  rd)
-    [[ -z "$pattern" ]] && usage
-    shopt -s nullglob
-    while true; do
-      for file in "$TUPLEDIR"/$pattern*; do
-        is_expired "$file" && continue
-        lock="$file.lock"
-        if ln "$file" "$lock" 2>/dev/null; then
-          cat "$file"
-          rm -f "$lock"
-          exit 0
+fileunlock() {
+    local lockname="$1"
+    rm -f "$TUPPLEDIR/$lockname$LOCKEXT"
+}
+
+clean_expired() {
+    for f in "$TUPPLEDIR"/*.*; do
+        local expires="${f##*.}"
+        if [[ "$expires" =~ ^[0-9]+$ ]]; then
+            if [[ "$expires" -le $(date +%s) ]]; then
+                rm -f "$f"
+            fi
         fi
-      done
-      sleep 0.1
     done
-    ;;
+}
 
-  ls)
-    shopt -s nullglob
-    pat="${pattern:-*}"
-    for file in "$TUPLEDIR"/$pat*; do
-      is_expired "$file" && continue
-      basename "$file"
+# === FIFO sequence ===
+next_seq() {
+    local name="$1"
+    local seqfile="$TUPPLEDIR/$name.seq"
+    filelock "$name.seq" || {
+        echo "Failed to acquire sequence lock for $name" >&2
+        return 1
+    }
+
+    local seq=0
+    if [ -f "$seqfile" ]; then
+        seq=$(< "$seqfile")
+    fi
+    printf "%08d" $((seq + 1)) > "$seqfile"
+    fileunlock "$name.seq"
+    printf -- "-%08d" "$seq"
+}
+
+# === Command: out ===
+cmd_out() {
+    local name="$1"; shift
+    local ttl=0
+    local seq=""
+
+    if [[ $# -gt 2 ]]; then
+        echo "Too many arguments" >&2
+        exit 1
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "seq" ]]; then
+            seq=$(next_seq "$name") || exit 1
+        elif [[ "$1" =~ ^[0-9]+$ ]]; then
+            ttl=$1
+        else
+            echo "Invalid argument: $1" >&2
+            exit 1
+        fi
+        shift
     done
-    ;;
 
-  *)
-    usage
-    ;;
+    local expires=""
+    if [ "$ttl" -gt 0 ]; then
+        expires=".$(( $(date +%s) + ttl ))"
+    fi
+
+    local rand
+    rand=$(head -c 6 /dev/urandom | base64 | tr -dc a-z0-9 | head -c6)
+    local fname="$TUPPLEDIR/${name}${seq}-${rand}${expires}"
+
+    local tmp
+    tmp=$(mktemp "$fname.tmp.XXXXXX")
+    cat > "$tmp"
+    mv "$tmp" "$fname"
+}
+
+# === Command: in / inp ===
+cmd_inp() {
+    local name="$1"
+    local mode="${2:-wait}"  # wait | once | N (timeout)
+
+    local timeout=0
+    local deadline=0
+    local now
+    if [[ "$mode" == "once" ]]; then
+        timeout=0
+    elif [[ "$mode" =~ ^[0-9]+$ ]]; then
+        now=$(date +%s)
+        deadline=$((now + mode))
+        timeout=1
+    fi
+
+    while :; do
+        for f in "$TUPPLEDIR/$name"*; do
+            cat "$f"
+            rm -f "$f"
+            return 0
+        done
+
+        if [ "$mode" == "once" ]; then
+            return 1
+        elif [ "$timeout" -eq 1 ]; then
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+                return 1
+            fi
+        fi
+        sleep 0.1
+    done
+}
+
+# === Command: rd ===
+cmd_rd() {
+    local name="$1"
+    for f in "$TUPPLEDIR/$name"*; do
+        cat "$f"
+        return 0
+    done
+    return 1
+}
+
+cmd_ls() {
+    local name="${1-}"
+    for f in "$TUPPLEDIR/$name"*; do
+        echo "$(basename "${f%%-*}")"
+    done | sort | uniq -c
+}
+
+cmd_clear() {
+    rm -f "$TUPPLEDIR/"*
+}
+
+# === Run ===
+mkdir -p "$TUPPLEDIR"
+clean_expired
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    out)   cmd_out "$@" ;;
+    inp)   cmd_inp "$@" ;;
+    rd)    cmd_rd "$@" ;;
+    ls)    cmd_ls "$@" ;;
+    clear) cmd_clear "$@" ;;
+    *) echo "Usage: $0 {out|in|rd|ls} ..." >&2; exit 1 ;;
 esac
