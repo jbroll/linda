@@ -13,7 +13,7 @@ LOCK_TIMEOUT=5  # seconds to wait for lock before giving up
 # === Locking with PID check and timeout ===
 filelock() {
     local lockname="$1"
-    local lockpath="$TUPPLEDIR/$lockname$LOCKEXT"
+    local lockpath="$lockname$LOCKEXT"
     local start now pid
 
     start=$(date +%s)
@@ -48,7 +48,7 @@ filelock() {
 
 fileunlock() {
     local lockname="$1"
-    rm -f "$TUPPLEDIR/$lockname$LOCKEXT"
+    rm -f "$lockname$LOCKEXT"
 }
 
 clean_expired() {
@@ -65,8 +65,8 @@ clean_expired() {
 # === FIFO sequence ===
 next_seq() {
     local name="$1"
-    local seqfile="$TUPPLEDIR/$name.seq"
-    filelock "$name.seq" || {
+    local seqfile="$TUPPLEDIR/.$name.seq"
+    filelock "$seqfile" || {
         echo "Failed to acquire sequence lock for $name" >&2
         return 1
     }
@@ -75,9 +75,18 @@ next_seq() {
     if [ -f "$seqfile" ]; then
         seq=$(< "$seqfile")
     fi
-    printf "%08d" $((seq + 1)) > "$seqfile"
-    fileunlock "$name.seq"
-    printf -- "-%08d" "$seq"
+    printf "%08d" $((${seq##[!0]*} + 1)) > "$seqfile"
+    fileunlock "$seqfile"
+    printf -- "-%08d" "${seq##[!0]*}"
+}
+
+hex() {
+    local bytes=${1-4}
+    local prefix=${2-}
+
+    rand=$(head -c $bytes /dev/random | od -An -t x$bytes)
+    rand=${rand// /}
+    echo "$prefix$rand"
 }
 
 # === Command: out ===
@@ -91,8 +100,11 @@ cmd_out() {
         exit 1
     fi
 
+    local hex="-$(hex)"
     while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "seq" ]]; then
+        if [[ "$1" == "rep" ]]; then
+            hex=""
+        elif [[ "$1" == "seq" ]]; then
             seq=$(next_seq "$name") || exit 1
         elif [[ "$1" =~ ^[0-9]+$ ]]; then
             ttl=$1
@@ -108,9 +120,7 @@ cmd_out() {
         expires=".$(( $(date +%s) + ttl ))"
     fi
 
-    local rand
-    rand=$(head -c 6 /dev/urandom | base64 | tr -dc a-z0-9 | head -c6)
-    local fname="$TUPPLEDIR/${name}${seq}-${rand}${expires}"
+    local fname="$TUPPLEDIR/${name}${seq}${hex}${expires}"
 
     local tmp
     tmp=$(mktemp "$fname.tmp.XXXXXX")
@@ -186,6 +196,6 @@ case "$cmd" in
     inp)   cmd_inp "$@" ;;
     rd)    cmd_rd "$@" ;;
     ls)    cmd_ls "$@" ;;
-    clear) cmd_clear "$@" ;;
-    *) echo "Usage: $0 {out|in|rd|ls} ..." >&2; exit 1 ;;
+    clear) cmd_clear ;;
+    *) echo "Usage: $0 {out|in|rd|ls|clear} ..." >&2; exit 1 ;;
 esac

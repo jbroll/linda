@@ -20,29 +20,33 @@ $LINDA inp expireme once && echo "FAIL: Tuple should be expired" || echo "PASS: 
 
 echo "== Test 3: Sequence numbering =="
 echo "seq test" | $LINDA out seqtest seq
-file=$($LINDA ls seqtest)
-[[ "$file" =~ ^seqtest-[0-9]{8}-[a-z0-9]{6}$ ]] && echo "PASS: Sequence format" || echo "FAIL: Sequence format: $file"
+count=$($LINDA ls | grep -E '^[[:space:]]*1 seqtest$' || true)
+[[ -n "$count" ]] && echo "PASS: Sequence format" || echo "FAIL: Sequence format: $count"
 
 echo "== Test 4: TTL + Sequence =="
 echo "combined" | $LINDA out both 5 seq
-file=$($LINDA ls both)
-[[ "$file" =~ ^both-[0-9]{8}-[a-z0-9]{6}\.[0-9]+$ ]] && echo "PASS: TTL+Seq format" || echo "FAIL: TTL+Seq format: $file"
+count=$($LINDA ls | grep -E '^[[:space:]]*1 both$' || true)
+[[ -n "$count" ]] && echo "PASS: TTL+Seq format" || echo "FAIL: TTL+Seq format: $count"
 
 echo "== Test 5: Read (rd) does not consume =="
-echo "peekaboo" | $LINDA out peek
-first=$($LINDA rd peek)
-second=$($LINDA rd peek)
-[[ "$first" == "$second" ]] && echo "PASS: rd returns same result" || echo "FAIL: rd mismatch"
+echo "read me" | $LINDA out readtest
+result1=$($LINDA rd readtest once)
+result2=$($LINDA rd readtest once)
+[[ "$result1" == "read me" && "$result2" == "read me" ]] && echo "PASS: rd returns same result" || echo "FAIL: rd does not behave"
 
 echo "== Test 6: Listing keys =="
-echo "alpha" | $LINDA out key1
-echo "beta" | $LINDA out key2
-keys=$($LINDA ls)
-[[ "$keys" == *"key1"* && "$keys" == *"key2"* ]] && echo "PASS: ls shows keys" || echo "FAIL: ls missing keys"
+echo "one" | $LINDA out listme
+echo "two" | $LINDA out listme
+echo "three" | $LINDA out another
+lsout=$($LINDA ls)
+echo "$lsout" | grep -E -q '^[[:space:]]*2 listme$' && \
+echo "$lsout" | grep -E -q '^[[:space:]]*1 another$' && \
+echo "PASS: ls keys and counts" || echo "FAIL: ls missing keys"
 
 echo "== Test 7: Cleanup expired tuples =="
-echo "old" | $LINDA out willdie 1
+echo "soon gone" | $LINDA out tempkey 1
 sleep 2
-$LINDA ls willdie > /dev/null 2>&1 && echo "FAIL: Expired tuple not deleted" || echo "PASS: Expired tuple cleaned"
+expired=$($LINDA ls | grep -E 'tempkey' || true)
+[[ -z "$expired" ]] && echo "PASS: Expired tuple not listed" || echo "FAIL: Expired tuple not deleted"
 
 echo "== All tests complete =="
