@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -euo pipefail
+set -u
 
 # Enable nullglob so globs that match nothing expand to zero words
 shopt -s nullglob
@@ -75,9 +75,9 @@ next_seq() {
     if [ -f "$seqfile" ]; then
         seq=$(< "$seqfile")
     fi
-    printf "%08d" $((${seq##[!0]*} + 1)) > "$seqfile"
+    printf "%08d" $((10#$seq + 1)) > "$seqfile"
     fileunlock "$seqfile"
-    printf -- "-%08d" "${seq##[!0]*}"
+    printf -- "-%08d" $((10#$seq))
 }
 
 hex() {
@@ -182,6 +182,8 @@ cmd_ls() {
 
 cmd_clear() {
     rm -f "$TUPPLEDIR/"*
+    rm -f "$TUPPLEDIR/".*.seq
+    rm -f "$TUPPLEDIR/".*.lock
 }
 
 # === Run ===
