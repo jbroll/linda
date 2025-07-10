@@ -1,11 +1,13 @@
 package provide linda 1.0
 
 namespace eval linda {
-    variable TUPLEDIR [::env(LINDA_DIR)]
+    variable TUPLEDIR $::env(LINDA_DIR)
     if {![info exists ::env(LINDA_DIR)] || $::env(LINDA_DIR) eq ""} {
         variable TUPLEDIR "/tmp/linda"
     }
     file mkdir $TUPLEDIR
+
+    variable LOCK_TIMEOUT 5
 
     proc _now {} {
         return [clock seconds]
@@ -14,16 +16,12 @@ namespace eval linda {
     proc _expire_tuples {} {
         variable TUPLEDIR
         set now [_now]
-        foreach file [glob -nocomplain -directory $TUPLEDIR *] {
+        foreach file [glob -nocomplain -directory $TUPLEDIR *.*] {
             set base [file tail $file]
-            # Expect format: name.expiry.rand
-            set parts [split $base "."]
-            if {[llength $parts] < 4} continue
-            set expiry [lindex $parts 1]
-            if {[string is integer -strict $expiry] && $expiry != 0} {
+            # Check if filename ends with .DIGITS (expiry timestamp)
+            if {[regexp {\.([0-9]+)$} $base -> expiry]} {
                 if {$now >= $expiry} {
                     catch {file delete -force $file}
-                    catch {file delete -force "${file}.lock"}
                 }
             }
         }
@@ -31,49 +29,96 @@ namespace eval linda {
 
     proc _is_expired {file} {
         set base [file tail $file]
-        set parts [split $base "."]
-        if {[llength $parts] < 4} {
-            return 1
-        }
-        set expiry [lindex $parts 1]
-        if {$expiry eq "0"} {
-            return 0
-        }
-        if {[string is integer -strict $expiry]} {
+        if {[regexp {\.([0-9]+)$} $base -> expiry]} {
             return [expr {[clock seconds] >= $expiry}]
         }
-        return 1
+        return 0
     }
 
-    proc _lock_file {file} {
-        # Use atomic file link to create lock file
-        set lockfile "${file}.lock"
-        catch {
-            file link $file $lockfile
-        } result options
-        if {[string match "*File exists*" $options(-errorinfo)]} {
-            return ""
-        } elseif {[catch {file link $file $lockfile}]} {
-            return ""
-        } else {
-            return $lockfile
-        }
-    }
-
-    proc _unlock_file {lockfile} {
-        catch {file delete -force $lockfile}
-    }
-
-    proc _find_and_lock {pattern} {
-        variable TUPLEDIR
-        foreach file [glob -nocomplain -directory $TUPLEDIR "${pattern}*"] {
-            if {[_is_expired $file]} continue
-            set lockfile [_lock_file $file]
-            if {$lockfile ne ""} {
-                return [list $file $lockfile]
+    proc _filelock {lockname} {
+        variable LOCK_TIMEOUT
+        set lockpath "${lockname}.lock"
+        set start [clock seconds]
+        
+        while 1 {
+            # Try to create lock file atomically
+            if {![catch {
+                set fd [open $lockpath {WRONLY CREAT EXCL}]
+                puts $fd [pid]
+                close $fd
+            }]} {
+                return 1
+            }
+            
+            # Check if lock file exists and validate PID
+            if {[file exists $lockpath]} {
+                set pid ""
+                catch {
+                    set fd [open $lockpath r]
+                    set pid [string trim [read $fd]]
+                    close $fd
+                }
+                
+                if {[string is integer -strict $pid]} {
+                    # Check if process is still running
+                    if {[catch {exec kill -0 $pid 2>/dev/null}]} {
+                        catch {file delete -force $lockpath}
+                        puts stderr "Removed stale lock held by PID $pid"
+                        continue
+                    }
+                } else {
+                    catch {file delete -force $lockpath}
+                    puts stderr "Removed corrupt lock file"
+                    continue
+                }
+            }
+            
+            after 50
+            set now [clock seconds]
+            if {($now - $start) >= $LOCK_TIMEOUT} {
+                puts stderr "Timeout acquiring lock $lockpath"
+                return 0
             }
         }
-        return [list "" ""]
+    }
+
+    proc _fileunlock {lockname} {
+        catch {file delete -force "${lockname}.lock"}
+    }
+
+    proc _next_seq {name} {
+        variable TUPLEDIR
+        set seqfile [file join $TUPLEDIR ".${name}.seq"]
+        
+        if {![_filelock $seqfile]} {
+            error "Failed to acquire sequence lock for $name"
+        }
+        
+        set seq 0
+        if {[file exists $seqfile]} {
+            catch {
+                set fd [open $seqfile r]
+                set seq [string trim [read $fd]]
+                close $fd
+            }
+        }
+        
+        incr seq
+        set fd [open $seqfile w]
+        puts $fd [format "%08d" $seq]
+        close $fd
+        
+        _fileunlock $seqfile
+        return [format "-%08d" $seq]
+    }
+
+    proc _hex {{bytes 4} {prefix ""}} {
+        set chars "0123456789abcdef"
+        set result $prefix
+        for {set i 0} {$i < [expr {$bytes * 2}]} {incr i} {
+            append result [string index $chars [expr {int(rand() * 16)}]]
+        }
+        return $result
     }
 
     proc out {name data args} {
@@ -81,42 +126,44 @@ namespace eval linda {
         _expire_tuples
 
         set ttl 0
-        if {[llength $args] >= 1} {
-            set ttl [lindex $args 0]
-            if {![string is integer -strict $ttl] || $ttl < 0} {
-                error "TTL must be a non-negative integer"
+        set seq ""
+        set hex "-[_hex]"
+        
+        foreach arg $args {
+            if {$arg eq "rep"} {
+                set hex ""
+            } elseif {$arg eq "seq"} {
+                set seq [_next_seq $name]
+            } elseif {[string is integer -strict $arg] && $arg >= 0} {
+                set ttl $arg
+            } else {
+                error "Invalid argument: $arg"
             }
         }
 
-        set expiry 0
+        set expires ""
         if {$ttl > 0} {
-            set expiry [expr {[clock seconds] + $ttl}]
+            set expires ".[expr {[clock seconds] + $ttl}]"
         }
 
-        # generate random suffix (6 chars)
-        set rand [string tolower [join [list] ""]]
-        foreach i {1 2 3 4 5 6} {
-            append rand [string index {abcdefghijklmnopqrstuvwxyz0123456789} [expr {int(rand()*36)}]]
-        }
-
-        set filename "${name}.${expiry}.${rand}"
+        set filename "${name}${seq}${hex}${expires}"
         set filepath [file join $TUPLEDIR $filename]
 
         # Write atomically: write to tmp then rename
-        set tmpfile [file join $TUPLEDIR "tmp.${name}.$$"]
-        set f [open $tmpfile w]
-        puts -nonewline $f $data
-        close $f
-        file rename -force $tmpfile $filepath
+        set tmpfile "${filepath}.tmp.[pid]"
+        set fd [open $tmpfile w]
+        puts -nonewline $fd $data
+        close $fd
+        file rename $tmpfile $filepath
     }
 
     proc inp {pattern args} {
         variable TUPLEDIR
         _expire_tuples
 
-        set mode "block"
+        set mode "wait"
         set timeout 0
-
+        
         if {[llength $args] >= 1} {
             set arg [lindex $args 0]
             if {$arg eq "once"} {
@@ -130,47 +177,59 @@ namespace eval linda {
         }
 
         set start [clock seconds]
+        set deadline 0
+        if {$mode eq "timeout"} {
+            set deadline [expr {$start + $timeout}]
+        }
 
         while 1 {
-            set res [_find_and_lock $pattern]
-            set file [lindex $res 0]
-            set lockfile [lindex $res 1]
-            if {$file ne ""} {
-                set f [open $file r]
-                set data [read $f]
-                close $f
+            foreach file [glob -nocomplain -directory $TUPLEDIR "${pattern}*"] {
+                if {[_is_expired $file]} continue
+                
+                set fd [open $file r]
+                set data [read $fd]
+                close $fd
                 file delete -force $file
-                _unlock_file $lockfile
                 return $data
             }
 
             if {$mode eq "once"} {
                 error "No tuple matching \"$pattern\""
             } elseif {$mode eq "timeout"} {
-                if {([clock seconds] - $start) >= $timeout} {
+                set now [clock seconds]
+                if {$now >= $deadline} {
                     error "Timeout waiting for tuple \"$pattern\""
                 }
             }
+            
             after 100
             update
         }
     }
 
-    proc rd {pattern} {
+    proc rd {pattern args} {
         variable TUPLEDIR
         _expire_tuples
 
+        set mode "wait"
+        if {[llength $args] >= 1 && [lindex $args 0] eq "once"} {
+            set mode "once"
+        }
+
         while 1 {
-            set res [_find_and_lock $pattern]
-            set file [lindex $res 0]
-            set lockfile [lindex $res 1]
-            if {$file ne ""} {
-                set f [open $file r]
-                set data [read $f]
-                close $f
-                _unlock_file $lockfile
+            foreach file [glob -nocomplain -directory $TUPLEDIR "${pattern}*"] {
+                if {[_is_expired $file]} continue
+                
+                set fd [open $file r]
+                set data [read $fd]
+                close $fd
                 return $data
             }
+            
+            if {$mode eq "once"} {
+                error "No tuple matching \"$pattern\""
+            }
+            
             after 100
             update
         }
@@ -185,11 +244,35 @@ namespace eval linda {
             set pattern [lindex $args 0]
         }
 
-        set result [list]
+        set names [dict create]
         foreach file [glob -nocomplain -directory $TUPLEDIR "${pattern}*"] {
             if {[_is_expired $file]} continue
-            lappend result [file tail $file]
+            
+            set base [file tail $file]
+            # Extract name from filename (everything before first hyphen or dot)
+            set name $base
+            if {[regexp {^([^-\.]+)} $base -> extracted]} {
+                set name $extracted
+            }
+            
+            if {[dict exists $names $name]} {
+                dict incr names $name
+            } else {
+                dict set names $name 1
+            }
         }
-        return $result
+        
+        set result [list]
+        dict for {name count} $names {
+            lappend result "$count $name"
+        }
+        return [lsort $result]
+    }
+
+    proc clear {} {
+        variable TUPLEDIR
+        foreach file [glob -nocomplain -directory $TUPLEDIR *] {
+            catch {file delete -force $file}
+        }
     }
 }
