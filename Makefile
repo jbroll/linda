@@ -7,3 +7,6 @@ test-sh:
 test-tcl:
 	tclsh test-linda.tcl
 	
+test-py:
+	python3 test-linda.py
+

@@ -5,6 +5,7 @@ import glob
 import random
 import string
 import contextlib
+import fcntl
 from pathlib import Path
 from typing import Union, Optional, List, Iterator
 
@@ -12,7 +13,7 @@ TUPLEDIR = Path(os.environ.get("LINDA_DIR", "/tmp/linda"))
 TUPLEDIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
-once = -1  # Fixed typo from original
+once = -1  # Special timeout value for non-blocking operations
 LOCK_TIMEOUT = 5.0  # seconds
 
 
@@ -28,23 +29,38 @@ class LockTimeout(Exception):
 
 def _random_suffix(length: int = 8) -> str:
     """Generate random hex suffix for tuple filenames."""
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return ''.join(random.choices('0123456789abcdef', k=length))
 
 
 def _parse_filename(filename: str) -> tuple[str, int, str]:
-    """Parse tuple filename into (name, expiry, suffix)."""
-    parts = filename.split('.')
-    if len(parts) < 3:
-        raise ValueError(f"Invalid tuple filename: {filename}")
+    """Parse tuple filename into (name, expiry, suffix).
     
-    name = parts[0]
-    try:
-        expiry = int(parts[1])
-    except ValueError:
-        raise ValueError(f"Invalid expiry in filename: {filename}")
+    Handles various filename formats:
+    - name-XXXXXXXX.expires
+    - name-NNNNNNNN-XXXXXXXX.expires (with sequence)
+    - name.expires (replacement semantics)
+    - name-XXXXXXXX (no expiry)
+    - name (replacement, no expiry)
+    """
+    if '.' in filename:
+        base, expires_str = filename.rsplit('.', 1)
+        try:
+            expiry = int(expires_str)
+        except ValueError:
+            # Not a valid expiry, treat as part of name
+            base = filename
+            expiry = 0
+    else:
+        base = filename
+        expiry = 0
     
-    suffix = '.'.join(parts[2:])
-    return name, expiry, suffix
+    # Extract the tuple name (everything before first hyphen, or the whole thing)
+    if '-' in base:
+        name = base.split('-')[0]
+    else:
+        name = base
+    
+    return name, expiry, base
 
 
 def _is_expired(filepath: Path) -> bool:
@@ -57,36 +73,78 @@ def _is_expired(filepath: Path) -> bool:
 
 
 @contextlib.contextmanager
-def _file_lock(filepath: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[Path]:
-    """Context manager for file locking using link-based atomic operations."""
+def _file_lock(filepath: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[None]:
+    """Context manager for file locking using fcntl."""
     lockfile = filepath.with_suffix(filepath.suffix + '.lock')
     start_time = time.time()
     
     while True:
         try:
-            # Atomic lock creation using hard link
-            os.link(str(filepath), str(lockfile))
+            # Create lock file and acquire exclusive lock
+            fd = os.open(str(lockfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, str(os.getpid()).encode())
             break
         except FileExistsError:
             # Check for stale locks and timeout
             if time.time() - start_time > timeout:
                 raise LockTimeout(f"Failed to acquire lock for {filepath}")
+            
+            # Check if lock is stale
+            try:
+                with open(lockfile, 'r') as f:
+                    pid = int(f.read().strip())
+                # Check if process is still running
+                try:
+                    os.kill(pid, 0)
+                except (OSError, ProcessLookupError):
+                    # Process is dead, remove stale lock
+                    lockfile.unlink(missing_ok=True)
+                    continue
+            except (FileNotFoundError, ValueError, OSError):
+                # Corrupt or missing lock file
+                lockfile.unlink(missing_ok=True)
+                continue
+                
             time.sleep(0.05)
         except FileNotFoundError:
             # Original file was deleted, can't lock
             raise TupleNotFound(f"Tuple file {filepath} not found")
     
     try:
-        yield lockfile
+        yield
     finally:
+        os.close(fd)
         lockfile.unlink(missing_ok=True)
+
+
+def _next_seq(name: str) -> str:
+    """Generate next sequence number for FIFO semantics."""
+    seqfile = TUPLEDIR / f".{name}.seq"
+    
+    try:
+        with _file_lock(seqfile):
+            seq = 0
+            if seqfile.exists():
+                try:
+                    seq = int(seqfile.read_text().strip())
+                except (ValueError, FileNotFoundError):
+                    seq = 0
+            
+            seq += 1
+            seqfile.write_text(f"{seq:08d}")
+            return f"-{seq:08d}"
+    except LockTimeout:
+        raise LockTimeout(f"Failed to acquire sequence lock for {name}")
 
 
 def _cleanup_expired() -> None:
     """Remove all expired tuple files."""
     current_time = time.time()
     
-    for filepath in TUPLEDIR.glob("*.*"):
+    for filepath in TUPLEDIR.glob("*"):
+        if filepath.name.startswith('.'):
+            continue  # Skip hidden files like sequence files
+        
         if _is_expired(filepath):
             try:
                 filepath.unlink()
@@ -100,27 +158,87 @@ def _cleanup_expired() -> None:
 def _find_matching_tuples(pattern: str) -> List[Path]:
     """Find all non-expired tuples matching the pattern."""
     matches = []
-    for filepath in TUPLEDIR.glob(f"{pattern}*"):
+    
+    # Handle glob patterns - if pattern contains *, use it directly
+    if '*' in pattern or '?' in pattern:
+        search_pattern = pattern
+    else:
+        # Exact name match - look for files starting with name
+        search_pattern = f"{pattern}*"
+    
+    for filepath in TUPLEDIR.glob(search_pattern):
+        if filepath.name.startswith('.'):
+            continue  # Skip hidden files
         if not _is_expired(filepath):
             matches.append(filepath)
-    return sorted(matches)  # Consistent ordering
+    
+    return sorted(matches)  # Consistent ordering for FIFO with sequences
 
 
-def out(name: str, data: Union[bytes, str], ttl: int = 0) -> None:
-    """Write a tuple with optional TTL."""
+def out(name: str, data: Union[bytes, str], *args, ttl: int = 0, mode: Optional[str] = None) -> None:
+    """Write a tuple with optional TTL and mode (sequence or replacement semantics).
+    
+    Supports multiple calling styles:
+    1. out(name, data) - basic
+    2. out(name, data, ttl=30, mode="seq") - keyword args
+    3. out(name, data, 30, "seq") - shell script style
+    
+    Args:
+        name: Tuple name
+        data: Tuple data (string or bytes)
+        *args: Variable arguments (TTL int, mode string)
+        ttl: Time to live in seconds (keyword only)
+        mode: Storage mode (keyword only)
+        
+    Mode options:
+        None (default): Normal tuple with random suffix
+        "seq": FIFO semantics with sequence numbering
+        "rep": Replacement semantics (no random suffix, overwrites)
+    """
     _cleanup_expired()
     
-    if ttl < 0:
+    # Parse variable args (shell script style) - these override keyword args
+    parsed_ttl = ttl
+    parsed_mode = mode
+    
+    for arg in args:
+        if isinstance(arg, int) and arg >= 0:
+            parsed_ttl = arg
+        elif arg in ("seq", "rep"):
+            if parsed_mode is not None:
+                raise ValueError(f"Mode already set to '{parsed_mode}', cannot also set '{arg}'")
+            parsed_mode = arg
+        else:
+            raise ValueError(f"Invalid argument: {arg}")
+    
+    if parsed_ttl < 0:
         raise ValueError("TTL must be non-negative")
     
-    expiry = int(time.time()) + ttl if ttl > 0 else 0
-    suffix = _random_suffix()
-    filename = f"{name}.{expiry}.{suffix}"
-    filepath = TUPLEDIR / filename
+    if parsed_mode is not None and parsed_mode not in ("seq", "rep"):
+        raise ValueError(f"Invalid mode: {parsed_mode}. Must be 'seq' or 'rep'")
     
     # Convert string to bytes if needed
     if isinstance(data, str):
         data = data.encode('utf-8')
+    
+    # Build filename components
+    expiry = int(time.time()) + parsed_ttl if parsed_ttl > 0 else 0
+    
+    # Sequence number for FIFO mode
+    seq_part = ""
+    if parsed_mode == "seq":
+        seq_part = _next_seq(name)
+    
+    # Random suffix (unless replacement mode)
+    suffix_part = ""
+    if parsed_mode != "rep":
+        suffix_part = f"-{_random_suffix()}"
+    
+    # Expiry part
+    expiry_part = f".{expiry}" if expiry > 0 else ""
+    
+    filename = f"{name}{seq_part}{suffix_part}{expiry_part}"
+    filepath = TUPLEDIR / filename
     
     # Atomic write using temporary file
     with tempfile.NamedTemporaryFile(
@@ -140,7 +258,7 @@ def inp(name_pattern: str, timeout: Optional[float] = None) -> bytes:
     Input (read and remove) a tuple matching the pattern.
     
     Args:
-        name_pattern: Pattern to match tuple names
+        name_pattern: Pattern to match tuple names (supports * and ? wildcards)
         timeout: None = block forever, once = non-blocking, positive = timeout in seconds
     
     Returns:
@@ -160,7 +278,7 @@ def inp(name_pattern: str, timeout: Optional[float] = None) -> bytes:
         
         filepath = matches[0]
         try:
-            with _file_lock(filepath):
+            with _file_lock(filepath, timeout=0.1):
                 with open(filepath, 'rb') as f:
                     data = f.read()
                 filepath.unlink()
@@ -193,9 +311,38 @@ def inp(name_pattern: str, timeout: Optional[float] = None) -> bytes:
         time.sleep(0.1)
 
 
-def rd(name_pattern: str) -> bytes:
-    """Read (peek) a tuple without removing it."""
+def rd(name_pattern: str, timeout: Optional[float] = None) -> bytes:
+    """Read (peek) a tuple without removing it.
+    
+    Args:
+        name_pattern: Pattern to match tuple names (supports * and ? wildcards)
+        timeout: None = block forever, once = non-blocking, positive = timeout in seconds
+    
+    Returns:
+        Tuple data as bytes
+        
+    Raises:
+        TupleNotFound: If no matching tuple (non-blocking mode)
+        TimeoutError: If timeout exceeded
+    """
     _cleanup_expired()
+    
+    if timeout == once:
+        # Non-blocking mode
+        matches = _find_matching_tuples(name_pattern)
+        if not matches:
+            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
+        
+        filepath = matches[0]
+        try:
+            with _file_lock(filepath, timeout=0.1):
+                with open(filepath, 'rb') as f:
+                    return f.read()
+        except (FileNotFoundError, TupleNotFound):
+            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
+    
+    # Blocking mode with optional timeout
+    start_time = time.time()
     
     while True:
         matches = _find_matching_tuples(name_pattern)
@@ -208,23 +355,40 @@ def rd(name_pattern: str) -> bytes:
             except (FileNotFoundError, TupleNotFound, LockTimeout):
                 continue
         
+        # Check timeout
+        if timeout is not None and timeout > 0:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(f"Timeout waiting for tuple '{name_pattern}'")
+        
         time.sleep(0.1)
 
 
 def ls(pattern: str = "*") -> List[str]:
-    """List all tuple names matching the pattern."""
+    """List all tuple names matching the pattern with counts.
+    
+    Args:
+        pattern: Pattern to match (default: "*" for all)
+        
+    Returns:
+        List of strings in format "count name" for each tuple name
+    """
     _cleanup_expired()
     
-    names = []
-    for filepath in TUPLEDIR.glob(f"{pattern}*"):
+    name_counts = {}
+    for filepath in TUPLEDIR.glob(pattern + "*" if not ('*' in pattern or '?' in pattern) else pattern):
+        if filepath.name.startswith('.'):
+            continue  # Skip hidden files
         if not _is_expired(filepath):
             try:
                 name, _, _ = _parse_filename(filepath.name)
-                names.append(name)
+                name_counts[name] = name_counts.get(name, 0) + 1
             except ValueError:
                 continue
     
-    return sorted(list(set(names)))  # Remove duplicates and sort
+    # Format as "count name" and sort
+    result = [f"{count} {name}" for name, count in name_counts.items()]
+    return sorted(result)
 
 
 def clear() -> None:

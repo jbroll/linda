@@ -1,3 +1,5 @@
 
 error.log
 .*.swp
+
+__pycache__/
