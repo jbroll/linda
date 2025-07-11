@@ -10,3 +10,5 @@ test-tcl:
 test-py:
 	python3 test-linda.py
 
+clean:
+	rm -rf error.log __pycache__

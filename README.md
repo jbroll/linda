@@ -2,21 +2,9 @@
 
 This repository contains minimal file-based implementations of the Linda tuple space concept in three languages:
 
-- **Python**: `linda.py` — data-agnostic API for storing and retrieving opaque bytes or strings as tuples
-- **Shell script**: `linda.sh` — CLI tool using atomic file operations and native locking
-- **Tcl**: `linda.tcl` — Tcl package providing similar API commands for tuple space access
-
-## Common Concepts
-
-- Tuples are stored as files in a directory (`LINDA_DIR` environment variable, default `/tmp/linda`)
-- Filenames encode tuple name, expiration timestamp (TTL), and a random suffix for uniqueness
-- Expired tuples are automatically cleaned up on each operation
-- Locking is done via atomic file creation with PID checking and timeout handling
-- Tuple contents are opaque bytes or text — no serialization or specific data format is enforced
-
-## Lock-Free Design (Tcl Implementation)
-
-The Tcl implementation uses a mostly lock-free design for maximum performance and concurrency:
+- **Tcl**: `linda.tcl` 
+- **Python**: `linda.py` 
+- **Shell script**: `linda.sh` 
 
 ### Lock-Free Operations
 
@@ -32,13 +20,11 @@ The Tcl implementation uses a mostly lock-free design for maximum performance an
 
 ### Replacement Semantics Limitation
 
-**IMPORTANT**: Mixing `out name data` (normal) and `out name data rep` (replacement) for the same tuple name results in **undefined behavior**.
+**Mixing `out name data` (normal) and `out name data rep` (replacement) for the same tuple name results in **undefined behavior**.
 
 - Normal `out` creates files like `name-XXXXXXXX` (with random suffix)
 - Replacement `out rep` creates files like `name` (no suffix)
 - A `rd` or `inp` operation might return data from either file type
-
-**Recommendation**: Use replacement semantics (`rep`) only for singleton tuples where you want exactly one value to exist. Do not mix `rep` with other `out` operations on the same tuple name.
 
 This design choice preserves the performance benefits of lock-free operation while acknowledging the semantic limitation.
 
@@ -93,12 +79,6 @@ linda.sh clear
 - **ls**: List unexpired tuples with counts by name
 - **clear**: Remove all tuples from the tuple space
 
-### File Naming Convention
-
-- **Standard**: `name-XXXXXXXX.expires` (name + random hex + optional expiry)
-- **With sequence**: `name-NNNNNNNN-XXXXXXXX.expires` (name + sequence + random hex + optional expiry)
-- **Replaceable**: `name.expires` (name + optional expiry, no random suffix)
-
 ## Tcl Package (linda.tcl)
 
 ### Commands
@@ -115,11 +95,17 @@ linda.sh clear
 - **rd**: Blocking read without removal, optional timeout in seconds or `once` keyword for non-blocking  
 - **ls**: List matching tuples
 
-## Implementation Notes
+## Common Concepts
 
-- All implementations use atomic filesystem operations for concurrency control
-- Shell implementation uses PID-based locking with stale lock detection and 5-second timeout
-- Expired tuples are cleaned automatically on each API invocation
-- Tuple data is treated as opaque content; no serialization enforced
-- Shell implementation supports sequence numbering for FIFO semantics and replacement semantics
-- Tcl implementation uses mostly lock-free design with documented limitations for mixed operation types
+- Tuples are stored as files in a directory (`LINDA_DIR` environment variable, default `/tmp/linda`)
+- Filenames encode tuple name, expiration timestamp (TTL), and a random suffix for uniqueness
+- Expired tuples are automatically cleaned up on each operation
+- Locking is done via atomic file creation with PID checking and timeout handling
+- Tuple contents are opaque bytes or text — no serialization or specific data format is enforced
+
+### File Naming Convention
+
+- **Standard**: `name-XXXXXXXX.expires` (name + random hex + optional expiry)
+- **With sequence**: `name-NNNNNNNN-XXXXXXXX.expires` (name + sequence + random hex + optional expiry)
+- **Replaceable**: `name.expires` (name + optional expiry, no random suffix)
+
