@@ -89,10 +89,10 @@ hex() {
     echo "$prefix$rand"
 }
 
-# === Internal function to attempt reading a tuple once ===
-_try_read_tuple() {
+# === Atomic read-and-consume operation ===
+_try_read_tuple_atomic() {
     local name="$1"
-    local consume="$2"  # 0 or 1
+    local consume="$2"  # "consume" or "read"
     local retry_count=0
     
     while [ "$retry_count" -lt 2 ]; do
@@ -101,21 +101,33 @@ _try_read_tuple() {
         for f in "$TUPPLEDIR/$name"*; do
             found_any=1
             
-            # Try to read the file
-            if cat "$f" 2>/dev/null; then
-                if [ "$consume" = "consume" ]; then
-                    rm -f "$f"
+            if [ "$consume" = "consume" ]; then
+                # For consume operations, we need atomic read-and-delete
+                #
+                if filelock "$f"; then
+                    if cat "$f" 2>/dev/null; then
+                        # Successfully read, now delete
+                        rm -f "$f"
+                        fileunlock "$f"
+                        return 0
+                    fi
+                    fileunlock "$f"
                 fi
-                return 0
+                # Lock failed or file disappeared, try next file
+            else
+                if cat "$f" 2>/dev/null; then
+                    return 0
+                fi
             fi
-            # File disappeared between glob and cat, continue to next file
+            
+            # Lock failed or file disappeared, try next file
         done
         
         if [ "$found_any" -eq 0 ]; then
             return 1  # No files matched the pattern
         fi
         
-        # All files in this glob disappeared, try one immediate re-glob
+        # All files in this glob were locked by others or disappeared, try one immediate re-glob
         retry_count=$((retry_count + 1))
     done
     
@@ -125,7 +137,7 @@ _try_read_tuple() {
 # === Internal function to handle waiting/timeout logic ===
 _wait_for_tuple() {
     local name="$1"
-    local consume="$2"     # 0 or 1
+    local consume="$2"     # "consume" or "read"
     local mode="${3:-wait}" # wait | once | timeout_seconds
     
     local timeout=0
@@ -141,7 +153,7 @@ _wait_for_tuple() {
     fi
 
     while :; do
-        if _try_read_tuple "$name" "$consume"; then
+        if _try_read_tuple_atomic "$name" "$consume"; then
             return 0
         fi
 
