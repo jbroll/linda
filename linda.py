@@ -253,6 +253,76 @@ def out(name: str, data: Union[bytes, str], *args, ttl: int = 0, mode: Optional[
     tmp_path.rename(filepath)
 
 
+def _try_read_tuple_atomic(pattern: str, consume: bool) -> bytes:
+    """Try to atomically read (and optionally consume) a tuple matching the pattern.
+    
+    This function implements the same locking strategy as the shell and Tcl versions:
+    - For consume operations: Use file locking for atomic read-and-delete
+    - For read-only operations: Simple read without locking
+    - Retry up to 2 times to handle race conditions
+    """
+    retry_count = 0
+    
+    while retry_count < 2:
+        matches = _find_matching_tuples(pattern)
+        found_any = len(matches) > 0
+        
+        for filepath in matches:
+            if consume:
+                # For consume operations, use atomic read-and-delete with locking
+                try:
+                    with _file_lock(filepath, timeout=0.1):  # Short lock timeout for retry
+                        with open(filepath, 'rb') as f:
+                            data = f.read()
+                        # Successfully read, now delete
+                        filepath.unlink()
+                        return data
+                except (FileNotFoundError, TupleNotFound, LockTimeout):
+                    # Lock failed or file disappeared, try next file
+                    continue
+            else:
+                # For read-only operations, simple read without locking
+                try:
+                    with open(filepath, 'rb') as f:
+                        return f.read()
+                except FileNotFoundError:
+                    # File disappeared, try next file
+                    continue
+        
+        if not found_any:
+            raise TupleNotFound(f"No tuple matching '{pattern}'")
+        
+        # All files were locked by others or disappeared, try one more time
+        retry_count += 1
+    
+    # Give up after retries
+    raise TupleNotFound(f"No tuple matching '{pattern}'")
+
+
+def _wait_for_tuple(pattern: str, consume: bool, timeout: Optional[float]) -> bytes:
+    """Wait for a tuple matching the pattern with optional timeout."""
+    if timeout == once:
+        # Non-blocking mode
+        return _try_read_tuple_atomic(pattern, consume)
+    
+    # Blocking mode with optional timeout
+    start_time = time.time()
+    
+    while True:
+        try:
+            return _try_read_tuple_atomic(pattern, consume)
+        except TupleNotFound:
+            pass  # Continue waiting
+        
+        # Check timeout
+        if timeout is not None and timeout > 0:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(f"Timeout waiting for tuple '{pattern}'")
+        
+        time.sleep(0.1)
+
+
 def inp(name_pattern: str, timeout: Optional[float] = None) -> bytes:
     """
     Input (read and remove) a tuple matching the pattern.
@@ -269,46 +339,7 @@ def inp(name_pattern: str, timeout: Optional[float] = None) -> bytes:
         TimeoutError: If timeout exceeded
     """
     _cleanup_expired()
-    
-    if timeout == once:
-        # Non-blocking mode
-        matches = _find_matching_tuples(name_pattern)
-        if not matches:
-            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
-        
-        filepath = matches[0]
-        try:
-            with _file_lock(filepath, timeout=0.1):
-                with open(filepath, 'rb') as f:
-                    data = f.read()
-                filepath.unlink()
-                return data
-        except (FileNotFoundError, TupleNotFound):
-            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
-    
-    # Blocking mode with optional timeout
-    start_time = time.time()
-    
-    while True:
-        matches = _find_matching_tuples(name_pattern)
-        
-        for filepath in matches:
-            try:
-                with _file_lock(filepath, timeout=0.1):  # Short lock timeout for retry
-                    with open(filepath, 'rb') as f:
-                        data = f.read()
-                    filepath.unlink()
-                    return data
-            except (FileNotFoundError, TupleNotFound, LockTimeout):
-                continue  # Try next match or retry
-        
-        # Check timeout
-        if timeout is not None and timeout > 0:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise TimeoutError(f"Timeout waiting for tuple '{name_pattern}'")
-        
-        time.sleep(0.1)
+    return _wait_for_tuple(name_pattern, consume=True, timeout=timeout)
 
 
 def rd(name_pattern: str, timeout: Optional[float] = None) -> bytes:
@@ -326,42 +357,7 @@ def rd(name_pattern: str, timeout: Optional[float] = None) -> bytes:
         TimeoutError: If timeout exceeded
     """
     _cleanup_expired()
-    
-    if timeout == once:
-        # Non-blocking mode
-        matches = _find_matching_tuples(name_pattern)
-        if not matches:
-            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
-        
-        filepath = matches[0]
-        try:
-            with _file_lock(filepath, timeout=0.1):
-                with open(filepath, 'rb') as f:
-                    return f.read()
-        except (FileNotFoundError, TupleNotFound):
-            raise TupleNotFound(f"No tuple matching '{name_pattern}'")
-    
-    # Blocking mode with optional timeout
-    start_time = time.time()
-    
-    while True:
-        matches = _find_matching_tuples(name_pattern)
-        
-        for filepath in matches:
-            try:
-                with _file_lock(filepath, timeout=0.1):
-                    with open(filepath, 'rb') as f:
-                        return f.read()
-            except (FileNotFoundError, TupleNotFound, LockTimeout):
-                continue
-        
-        # Check timeout
-        if timeout is not None and timeout > 0:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise TimeoutError(f"Timeout waiting for tuple '{name_pattern}'")
-        
-        time.sleep(0.1)
+    return _wait_for_tuple(name_pattern, consume=False, timeout=timeout)
 
 
 def ls(pattern: str = "*") -> List[str]:
@@ -399,6 +395,3 @@ def clear() -> None:
         except FileNotFoundError:
             pass
 
-
-# Backwards compatibility aliases
-in_ = inp  # Avoid Python keyword conflict

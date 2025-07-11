@@ -236,13 +236,6 @@ class TestLinda(unittest.TestCase):
         result = linda.inp("bytes_test", linda.once)
         self.assertEqual(result, b"hello bytes")
 
-    def test_backwards_compatibility(self):
-        """Test backwards compatibility aliases."""
-        # Test in_ alias
-        linda.out("compat", "test")
-        result = linda.in_("compat", linda.once)
-        self.assertEqual(result, b"test")
-
     def test_invalid_arguments(self):
         """Test error handling for invalid arguments."""
         # Negative TTL should raise ValueError

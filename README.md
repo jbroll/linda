@@ -8,14 +8,13 @@ This repository contains minimal file-based implementations of the Linda tuple s
 
 ### Lock-Free Operations
 
-- **Reads (`inp`/`rd`)**: Use atomic filesystem operations. If a file is removed between `glob` and `open`, the operation retries with a fresh directory listing. Once a file handle is obtained, the file contents remain stable even if another process removes the file.
-
+- **Reads (`rd`)**: Use atomic filesystem operations. If a file is removed between `glob` and `open`, the operation retries with a fresh directory listing. Once a file handle is obtained, the file contents remain stable even if another process removes the file.
 - **Writes (`out`)**: Use atomic write-then-rename semantics. Each write creates a unique temporary file, writes the data, then atomically renames it to the final filename.
 
-- **Tuple consumption (`inp`)**: After reading a tuple, attempts to remove the file. If removal fails (another process consumed it), that's acceptable since we already have the data.
 
-### Locking Used Only For
+### Locking Operations
 
+- **Tuple consumption (`inp`)**: Lock to read a tuple, remove the file after read. If removal fails (another process consumed it), that's acceptable since we already have the data.
 - **Sequence number generation**: The `seq` flag requires coordinated sequence numbering, so file-based locking is used only for the sequence file.
 
 ### Replacement Semantics Limitation
@@ -98,7 +97,7 @@ linda.sh clear
 ## Common Concepts
 
 - Tuples are stored as files in a directory (`LINDA_DIR` environment variable, default `/tmp/linda`)
-- Filenames encode tuple name, expiration timestamp (TTL), and a random suffix for uniqueness
+- Filenames encode tuple name, optional sequence number, optional expiration timestamp (TTL), and a random suffix for uniqueness
 - Expired tuples are automatically cleaned up on each operation
 - Locking is done via atomic file creation with PID checking and timeout handling
 - Tuple contents are opaque bytes or text — no serialization or specific data format is enforced
