@@ -1,6 +1,5 @@
 package provide linda 1.0
 
-# Flexible resource management
 proc with {resource as variable {free {}} {block {}}} {
     if {$as ne "as"} {
         lassign [list $resource $variable] variable resource
@@ -23,7 +22,6 @@ proc with {resource as variable {free {}} {block {}}} {
     }
 }
 
-# File locking utilities
 namespace eval filelock {
     variable TIMEOUT 5
 
@@ -144,7 +142,6 @@ namespace eval linda {
         variable TUPLEDIR
         _expire_tuples
 
-        # Parse arguments using lassign for clean unpacking
         set ttl 0
         set seq ""
         set suffix "-[_random_hex]"
@@ -163,7 +160,6 @@ namespace eval linda {
             }
         }
 
-        # Build filename and write atomically
         set expires [expr {$ttl > 0 ? ".[expr {[clock seconds] + $ttl}]" : ""}]
         set filepath [file join $TUPLEDIR "${name}${seq}${suffix}${expires}"]
         
@@ -172,26 +168,32 @@ namespace eval linda {
 
     proc _try_read_tuple {pattern consume} {
         variable TUPLEDIR
+        set retry_count 0
         
-        foreach file [lsort [glob -nocomplain -directory $TUPLEDIR "${pattern}*"]] {
-            if {[_is_expired $file]} continue
+        foreach try { first second } {
+            set any 0
             
-            # Lock-free read attempt
-            try {
-                with [open $file r] as fd {
-                    set data [read $fd]
-                }
+            foreach file [lsort [glob -nocomplain -directory $TUPLEDIR "${pattern}*"]] {
+                if {[_is_expired $file]} continue
+                set any 1
                 
-                # If consuming, try to remove (may fail - that's ok)
-                if {$consume} {
-                    catch {file delete -force $file}
-                }
-                return $data
-            } on error {} {
-                # File disappeared between glob and open - continue to next
+                if { ![catch {
+                    set fd [open $file r]
+                    set data [read $fd]
+                    close $fd
+                } err] } {
+                    if {$consume} { catch {file delete -force $file} }
+
+                    return $data 
+                } 
+            }
+            
+            if {!$any} {
+                error "No tuple found"  # No files matched pattern
             }
         }
-        return ""
+        
+        error "No tuple found"
     }
 
     proc _wait_for_tuple {pattern consume mode timeout} {
@@ -199,9 +201,10 @@ namespace eval linda {
         set deadline [expr {$mode eq "timeout" ? $start + $timeout : 0}]
 
         while 1 {
-            set data [_try_read_tuple $pattern $consume]
-            if {$data ne ""} {
-                return $data
+            try {
+                return [_try_read_tuple $pattern $consume]
+            } on error {} {
+                # No tuple found, continue waiting unless mode says otherwise
             }
 
             switch $mode {

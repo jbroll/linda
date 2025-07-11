@@ -1,7 +1,6 @@
 #!/bin/bash
-set -uo pipefail
 
-# Source the test framework
+set -uo pipefail
 . ./Test
 
 LINDA="./linda.sh"
