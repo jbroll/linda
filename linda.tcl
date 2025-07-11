@@ -166,31 +166,56 @@ namespace eval linda {
         _atomic_write $filepath $data
     }
 
-    proc _try_read_tuple {pattern consume} {
+    proc _try_read_tuple_atomic {pattern consume} {
         variable TUPLEDIR
         set retry_count 0
         
-        foreach try { first second } {
+        # Try up to 2 times to handle race conditions
+        while {$retry_count < 2} {
             set any 0
             
             foreach file [lsort [glob -nocomplain -directory $TUPLEDIR "${pattern}*"]] {
                 if {[_is_expired $file]} continue
                 set any 1
                 
-                if { ![catch {
-                    set fd [open $file r]
-                    set data [read $fd]
-                    close $fd
-                } err] } {
-                    if {$consume} { catch {file delete -force $file} }
-
-                    return $data 
-                } 
+                if {$consume} {
+                    # For consume operations, use atomic read-and-delete with locking
+                    #
+                    if {[filelock acquire $file]} {
+                        try {
+                            with [open $file r] as fd {
+                                set data [read $fd]
+                            }
+                            # Successfully read, now delete
+                            file delete -force $file
+                            filelock release $file
+                            return $data
+                        } on error {} {
+                            # File disappeared or read failed
+                        } finally {
+                            filelock release $file
+                        }
+                    }
+                    # Lock failed or file disappeared, try next file
+                } else {
+                    # For read-only operations, simple read without locking (matches shell script)
+                    try {
+                        with [open $file r] as fd {
+                            set data [read $fd]
+                        }
+                        return $data
+                    } on error {} {
+                        # File disappeared or read failed, try next file
+                    }
+                }
             }
             
             if {!$any} {
                 error "No tuple found"  # No files matched pattern
             }
+            
+            # All files were locked by others or disappeared, try one more time
+            incr retry_count
         }
         
         error "No tuple found"
@@ -202,7 +227,7 @@ namespace eval linda {
 
         while 1 {
             try {
-                return [_try_read_tuple $pattern $consume]
+                return [_try_read_tuple_atomic $pattern $consume]
             } on error {} {
                 # No tuple found, continue waiting unless mode says otherwise
             }
