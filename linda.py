@@ -46,6 +46,11 @@ def _parse_filename(filename: str) -> tuple[str, int, str]:
         base, expires_str = filename.rsplit('.', 1)
         try:
             expiry = int(expires_str)
+            # Require a plausible Unix timestamp (10+ digits, >= year 2001)
+            # to avoid treating short numeric suffixes in tuple names as expiry.
+            if expiry < 1_000_000_000:
+                base = filename
+                expiry = 0
         except ValueError:
             # Not a valid expiry, treat as part of name
             base = filename
@@ -82,7 +87,12 @@ def _file_lock(filepath: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[None]:
         try:
             # Create lock file and acquire exclusive lock
             fd = os.open(str(lockfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.write(fd, str(os.getpid()).encode())
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            except Exception:
+                os.close(fd)
+                lockfile.unlink(missing_ok=True)
+                raise
             break
         except FileExistsError:
             # Check for stale locks and timeout
@@ -315,7 +325,7 @@ def _wait_for_tuple(pattern: str, consume: bool, timeout: Optional[float]) -> by
             pass  # Continue waiting
         
         # Check timeout
-        if timeout is not None and timeout > 0:
+        if timeout is not None and timeout >= 0:
             elapsed = time.time() - start_time
             if elapsed >= timeout:
                 raise TimeoutError(f"Timeout waiting for tuple '{pattern}'")

@@ -1,110 +1,88 @@
-# Linda Tuple Space Implementations
+# Linda Tuple Space
 
-This repository contains minimal file-based implementations of the Linda tuple space concept in three languages:
+A minimal, file-based implementation of [Linda](https://en.wikipedia.org/wiki/Linda_(coordination_language)) tuple-space coordination primitives — available in Shell, Tcl, and Python, with an optional HTTP REST API.
 
-- **Tcl**: `linda.tcl` 
-- **Python**: `linda.py` 
-- **Shell script**: `linda.sh` 
+## What is a tuple space?
 
-### Lock-Free Operations
+A tuple space is a shared, persistent blackboard for inter-process communication. Processes write named data items (*tuples*) into the space and other processes read or consume them. Readers block until a matching tuple appears, making it a natural fit for task queues, worker pools, and pipeline coordination.
 
-- **Reads (`rd`)**: Use atomic filesystem operations. If a file is removed between `glob` and `open`, the operation retries with a fresh directory listing. Once a file handle is obtained, the file contents remain stable even if another process removes the file.
-- **Writes (`out`)**: Use atomic write-then-rename semantics. Each write creates a unique temporary file, writes the data, then atomically renames it to the final filename.
+The three core operations are:
 
+| Operation | Meaning |
+|-----------|---------|
+| `out name data` | Write a tuple |
+| `rd  name`      | Read a tuple (non-destructive, blocks until present) |
+| `inp name`      | Consume a tuple (read + remove, blocks until present) |
 
-### Locking Operations
+## How it works
 
-- **Tuple consumption (`inp`)**: Lock to read a tuple, remove the file after read. If removal fails (another process consumed it), that's acceptable since we already have the data.
-- **Sequence number generation**: The `seq` flag requires coordinated sequence numbering, so file-based locking is used only for the sequence file.
+Tuples are plain files in a directory (`LINDA_DIR`, default `/tmp/linda`). The filename encodes the tuple name, an optional sequence number (FIFO ordering), an optional random suffix (uniqueness), and an optional expiry timestamp (TTL). Writes are atomic (temp-file + rename). Reads are lock-free. Consumes use a per-file PID lock with stale-lock recovery.
 
-### Replacement Semantics Limitation
+Because storage is the filesystem, any number of processes in any language can share the same tuple space simultaneously.
 
-**Mixing `out name data` (normal) and `out name data rep` (replacement) for the same tuple name results in **undefined behavior**.
+## Implementations
 
-- Normal `out` creates files like `name-XXXXXXXX` (with random suffix)
-- Replacement `out rep` creates files like `name` (no suffix)
-- A `rd` or `inp` operation might return data from either file type
+| File | Language | Usage |
+|------|----------|-------|
+| `linda.sh`  | Bash | CLI — pipe data in/out |
+| `linda.tcl` | Tcl  | `package require linda` (namespace ensemble) |
+| `linda.py`  | Python 3 | `import linda` |
+| `linda-http.tcl` | Tcl + wapp | HTTP REST API |
 
-This design choice preserves the performance benefits of lock-free operation while acknowledging the semantic limitation.
+See the per-implementation reference docs:
 
-## Python API (linda.py)
+- [Shell CLI](doc/shell.md)
+- [Tcl package](doc/tcl.md)
+- [Python module](doc/python.md)
+- [HTTP API](doc/http.md)
 
-### Functions
+## Quick examples
 
-- `linda.out(name: str, data: bytes | str, ttl: int = 0)`
-- `linda.inp(name_pattern: str, timeout: int | None = None) -> bytes`
-- `linda.rd(name_pattern: str) -> bytes`
-- `linda.ls(name_pattern: str) -> list[str]`
-- `linda.once = -1` (Use as timeout to perform a non-blocking in)
+**Shell**
+```bash
+echo "payload" | ./linda.sh out jobs
+./linda.sh inp jobs          # blocks until a tuple appears, then prints it
+./linda.sh rd  jobs once     # non-blocking peek
+```
 
-### Usage Example
+**Tcl**
+```tcl
+source linda.tcl
+linda out jobs "payload"
+set data [linda inp jobs]        ;# blocks
+set data [linda inp jobs once]   ;# non-blocking
+```
 
+**Python**
 ```python
 import linda
-
-linda.out("job", b"payload", ttl=30)
-
-data = linda.in_("job")  # blocks indefinitely
-data = linda.in_("job", timeout=5)  # blocks up to 5 seconds
-
-try:
-    data = linda.in_("job", timeout=linda.once)  # non-blocking
-except FileNotFoundError:
-    print("No tuple available")
-
-peek = linda.rd("job")
-print(linda.ls("job*"))
+linda.out("jobs", b"payload")
+data = linda.inp("jobs")           # blocks
+data = linda.inp("jobs", linda.once)  # non-blocking (raises TupleNotFound)
 ```
 
-## Shell CLI (linda.sh)
+**HTTP**
+```bash
+curl -X POST http://localhost:8080/tuples/jobs -d "payload"
+curl          http://localhost:8080/tuples/jobs        # rd
+curl -X DELETE http://localhost:8080/tuples/jobs       # inp
+```
 
-### Commands
+## Features
+
+- **TTL** — tuples expire automatically after N seconds
+- **FIFO** (`seq` mode) — sequence-numbered tuples are consumed in order
+- **Replacement** (`rep` mode) — at most one tuple per name; second write overwrites the first
+- **Pattern matching** — `rd`/`inp`/`ls` accept glob patterns (`job*`)
+- **Blocking / timeout / non-blocking** — all read operations support all three modes
+- **Cross-language** — Shell, Tcl, and Python share the same file format and locking protocol
+
+## Running the tests
 
 ```bash
-echo "$DATA" | linda.sh out name [ttl_seconds|seq|rep]
-linda.sh inp name-or-pattern [once|timeout_seconds]
-linda.sh rd name-or-pattern [once]
-linda.sh ls [name-or-pattern]
-linda.sh clear
+make test          # all suites
+make test-sh       # Shell (17 tests)
+make test-tcl      # Tcl   (26 tests)
+make test-py       # Python (35 tests)
+./test-linda-http.sh   # HTTP (19 tests, requires wapp.tcl)
 ```
-
-### Command Descriptions
-
-- **out**: Write tuple with optional TTL in seconds. Additional options:
-  - `seq`: Adds sequence number for FIFO ordering
-  - `rep`: Omits random suffix for replacement semantics
-- **inp**: Blocking read-and-remove; optional second arg `once` (non-blocking) or timeout in seconds
-- **rd**: Blocking read without removing; optional `once` arg for non-blocking
-- **ls**: List unexpired tuples with counts by name
-- **clear**: Remove all tuples from the tuple space
-
-## Tcl Package (linda.tcl)
-
-### Commands
-
-- `linda out name data ?ttl?`
-- `linda inp namePattern ?timeout?`
-- `linda rd namePattern ?timeout?`
-- `linda ls ?namePattern?`
-
-### Command Descriptions
-
-- **out**: Write tuple data (string), optional TTL seconds
-- **inp**: Blocking read-and-remove, optional timeout in seconds or `once` keyword for non-blocking
-- **rd**: Blocking read without removal, optional timeout in seconds or `once` keyword for non-blocking  
-- **ls**: List matching tuples
-
-## Common Concepts
-
-- Tuples are stored as files in a directory (`LINDA_DIR` environment variable, default `/tmp/linda`)
-- Filenames encode tuple name, optional sequence number, optional expiration timestamp (TTL), and a random suffix for uniqueness
-- Expired tuples are automatically cleaned up on each operation
-- Locking is done via atomic file creation with PID checking and timeout handling
-- Tuple contents are opaque bytes or text — no serialization or specific data format is enforced
-
-### File Naming Convention
-
-- **Standard**: `name-XXXXXXXX.expires` (name + random hex + optional expiry)
-- **With sequence**: `name-NNNNNNNN-XXXXXXXX.expires` (name + sequence + random hex + optional expiry)
-- **Replaceable**: `name.expires` (name + optional expiry, no random suffix)
-

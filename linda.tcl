@@ -82,9 +82,9 @@ namespace eval filelock {
 
 # Linda tuple space implementation
 namespace eval linda {
-    variable TUPLEDIR $::env(LINDA_DIR)
-    if {![info exists ::env(LINDA_DIR)] || $::env(LINDA_DIR) eq ""} {
-        variable TUPLEDIR "/tmp/linda"
+    variable TUPLEDIR "/tmp/linda"
+    if {[info exists ::env(LINDA_DIR)] && $::env(LINDA_DIR) ne ""} {
+        variable TUPLEDIR $::env(LINDA_DIR)
     }
     file mkdir $TUPLEDIR
 
@@ -92,17 +92,16 @@ namespace eval linda {
         variable TUPLEDIR
         set now [clock seconds]
         foreach file [glob -nocomplain -directory $TUPLEDIR *.*] {
-            if {[regexp {\.(\d+)$} [file tail $file] -> expiry] && $now >= $expiry} {
+            if {[regexp {\.(\d+)$} [file tail $file] -> expiry] &&
+                $expiry >= 1000000000 && $now >= $expiry} {
                 catch {file delete -force $file}
             }
         }
     }
 
     proc _is_expired {file} {
-        return [expr {
-            [regexp {\.(\d+)$} [file tail $file] -> expiry] && 
-            [clock seconds] >= $expiry
-        }]
+        if {![regexp {\.(\d+)$} [file tail $file] -> expiry]} { return 0 }
+        return [expr {$expiry >= 1000000000 && [clock seconds] >= $expiry}]
     }
 
     proc _next_seq {name} {
@@ -127,7 +126,11 @@ namespace eval linda {
     }
 
     proc _random_hex {{bytes 4}} {
-        return [format %0[expr {$bytes*2}]x [expr {int(rand() * (16**($bytes*2)))}]]
+        set result ""
+        for {set i 0} {$i < $bytes} {incr i} {
+            append result [format "%02x" [expr {int(rand() * 256)}]]
+        }
+        return $result
     }
 
     proc _atomic_write {filepath data} {
@@ -188,7 +191,6 @@ namespace eval linda {
                             }
                             # Successfully read, now delete
                             file delete -force $file
-                            filelock release $file
                             return $data
                         } on error {} {
                             # File disappeared or read failed
@@ -318,7 +320,7 @@ namespace eval linda {
 
     proc clear {} {
         variable TUPLEDIR
-        foreach file [glob -nocomplain -directory $TUPLEDIR *] {
+        foreach file [glob -nocomplain -directory $TUPLEDIR * .*.seq .*.seq.lock] {
             catch {file delete -force $file}
         }
     }

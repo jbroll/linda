@@ -213,6 +213,75 @@ test ls-with-pattern {ls command with pattern matching} -body {
     expr {[llength $result] == 2}
 } -result 1
 
+# === Test 21: Dotted name with short numeric suffix must not be expired ===
+test dotted-name-rep-not-expired {rep-mode tuple whose name ends in .NNN is not deleted as expired} -body {
+    linda::clear
+    linda::out "task.123" "payload" rep
+    linda::rd "task.123" once
+} -result "payload"
+
+# === Test 22: Short numeric suffix survives _expire_tuples ===
+test short-numeric-suffix-not-expired {File ending in short number after dot is not treated as expired} -body {
+    linda::clear
+    set f [file join $::env(LINDA_DIR) "event.2"]
+    set fd [open $f w]; puts -nonewline $fd "data"; close $fd
+    linda::_expire_tuples
+    file exists $f
+} -cleanup {
+    catch {file delete -force [file join $::env(LINDA_DIR) "event.2"]}
+} -result 1
+
+# === Test 23: Stale lock from dead process is recovered ===
+test stale-lock-recovery {Stale lock file from dead PID is removed and lock acquired} -body {
+    linda::out staletest "data"
+    set files [glob -nocomplain -directory $::env(LINDA_DIR) staletest*]
+    set tuplefile [lindex $files 0]
+    set lockfile "${tuplefile}.lock"
+    set fd [open $lockfile w]
+    puts $fd "999999999"
+    close $fd
+    linda::inp staletest once
+} -result "data"
+
+# === Test 24: seq + rep together — both effects apply in Tcl ===
+test conflicting-modes-seq-rep {out with seq and rep: sequence number present, no random hex} -body {
+    linda::clear
+    linda::out modetest "data" seq rep
+    set files [glob -nocomplain -directory $::env(LINDA_DIR) modetest*]
+    # Should be exactly one file, named modetest-NNNNNNNN (seq + no random hex)
+    set basename [file tail [lindex $files 0]]
+    regexp {^modetest-\d{8}$} $basename
+} -result 1
+
+# === Test 25: ls count numerical accuracy ===
+test ls-counts-accurate {ls returns correct per-name counts} -body {
+    linda::clear
+    linda::out alpha "x"
+    linda::out alpha "x"
+    linda::out alpha "x"
+    linda::out beta "y"
+    linda::out beta "y"
+    set d [dict create]
+    foreach entry [linda::ls] {
+        lassign $entry count name
+        dict set d $name $count
+    }
+    list [dict get $d alpha] [dict get $d beta]
+} -result {3 2}
+
+# === Test 26: ls count after rep overwrite must be 1 ===
+test ls-counts-rep-as-one {ls reports count=1 after two rep-mode writes} -body {
+    linda::clear
+    linda::out singleton "v1" rep
+    linda::out singleton "v2" rep
+    set d [dict create]
+    foreach entry [linda::ls] {
+        lassign $entry count name
+        dict set d $name $count
+    }
+    dict get $d singleton
+} -result 1
+
 # Cleanup
 cleanupTests
 file delete -force $testDir

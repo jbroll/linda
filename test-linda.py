@@ -5,6 +5,7 @@ import os
 import time
 import tempfile
 import shutil
+import threading
 from pathlib import Path
 
 # Set up test environment before importing linda
@@ -283,6 +284,151 @@ class TestLinda(unittest.TestCase):
         # Should not be able to get another
         with self.assertRaises(linda.TupleNotFound):
             linda.inp("concurrent", linda.once)
+
+    # === Gap 1: Dotted name with numeric suffix must not be treated as expiry ===
+
+    def test_dotted_name_with_numeric_suffix_not_expired(self):
+        """rep-mode tuple whose name ends in .NNN must not be deleted as if expired."""
+        linda.out("task.123", "payload", mode="rep")
+        # Must still be present immediately after writing
+        result = linda.rd("task.123", linda.once)
+        self.assertEqual(result, b"payload")
+
+    def test_dotted_name_with_numeric_suffix_in_ls(self):
+        """ls must count a dotted-name tuple correctly, not discard it."""
+        linda.out("item.42", "value", mode="rep")
+        names = [e.split()[1] for e in linda.ls()]
+        # The full dotted name is preserved as the tuple name
+        self.assertIn("item.42", names)
+
+    # === Gap 2: Short numeric suffix must not be treated as expiry ===
+
+    def test_short_numeric_suffix_not_treated_as_expiry(self):
+        """A file whose name ends in a short number after a dot must survive cleanup."""
+        target = linda.TUPLEDIR / "event.2"
+        target.write_bytes(b"data")
+        linda._cleanup_expired()
+        self.assertTrue(target.exists(), "Short numeric suffix incorrectly treated as expiry")
+        target.unlink(missing_ok=True)
+
+    # === Gap 3: rd survives a concurrent inp deleting the file ===
+
+    def test_rd_survives_concurrent_inp(self):
+        """rd must return data even if inp concurrently deletes the file."""
+        linda.out("shared", "value")
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def reader():
+            barrier.wait()
+            try:
+                results["rd"] = linda.rd("shared", 2)
+            except (linda.TupleNotFound, TimeoutError):
+                results["rd"] = None
+
+        def consumer():
+            barrier.wait()
+            try:
+                results["inp"] = linda.inp("shared", 2)
+            except (linda.TupleNotFound, TimeoutError):
+                results["inp"] = None
+
+        t1 = threading.Thread(target=reader)
+        t2 = threading.Thread(target=consumer)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        # At least one must have gotten the value
+        self.assertIn(b"value", [results.get("rd"), results.get("inp")])
+        # The tuple must now be consumed
+        with self.assertRaises(linda.TupleNotFound):
+            linda.inp("shared", linda.once)
+
+    # === Gap 4: Two concurrent inp callers — exactly one wins ===
+
+    def test_concurrent_inp_only_one_wins(self):
+        """Exactly one of two concurrent inp callers must receive the tuple."""
+        results = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def consume():
+            barrier.wait()
+            try:
+                data = linda.inp("race", 2)
+                with lock:
+                    results.append(("ok", data))
+            except (linda.TupleNotFound, TimeoutError):
+                with lock:
+                    results.append(("miss", None))
+
+        threads = [threading.Thread(target=consume) for _ in range(2)]
+        for t in threads:
+            t.start()
+        # Add the tuple after threads are waiting at the barrier
+        time.sleep(0.05)
+        linda.out("race", "prize")
+        for t in threads:
+            t.join()
+
+        ok_results = [r for r in results if r[0] == "ok"]
+        miss_results = [r for r in results if r[0] == "miss"]
+        self.assertEqual(len(ok_results), 1)
+        self.assertEqual(len(miss_results), 1)
+        self.assertEqual(ok_results[0][1], b"prize")
+
+    # === Gap 5: Stale lock from dead process is recovered ===
+
+    def test_stale_lock_recovery(self):
+        """A lock file left by a dead process must be cleaned up automatically."""
+        linda.out("stale_test", "data")
+        matches = list(linda.TUPLEDIR.glob("stale_test*"))
+        self.assertEqual(len(matches), 1)
+        filepath = matches[0]
+        lockfile = filepath.with_suffix(filepath.suffix + '.lock')
+        lockfile.write_text("999999999")  # PID guaranteed not running
+        result = linda.inp("stale_test", linda.once)
+        self.assertEqual(result, b"data")
+        self.assertFalse(lockfile.exists())
+
+    # === Gap 6: Conflicting modes seq + rep raise ValueError ===
+
+    def test_conflicting_modes_seq_and_rep_raises(self):
+        """Providing both seq and rep to out must raise ValueError."""
+        with self.assertRaises(ValueError):
+            linda.out("conflict", "data", "seq", "rep")
+        with self.assertRaises(ValueError):
+            linda.out("conflict", "data", "rep", "seq")
+
+    # === Gap 7: timeout=0 expires immediately (non-blocking) ===
+
+    def test_timeout_zero_expires_immediately(self):
+        """timeout=0 must raise TimeoutError immediately, not block forever."""
+        start = time.time()
+        with self.assertRaises(TimeoutError):
+            linda.inp("absent_zero", 0)
+        self.assertLess(time.time() - start, 1.0, "timeout=0 should not block")
+
+    # === Gap 8: ls count format and numerical accuracy ===
+
+    def test_ls_counts_are_accurate(self):
+        """ls must return accurate per-name counts in 'count name' format."""
+        for _ in range(3):
+            linda.out("alpha", "x")
+        for _ in range(2):
+            linda.out("beta", "y")
+        counts = {e.split()[1]: int(e.split()[0]) for e in linda.ls()}
+        self.assertEqual(counts.get("alpha"), 3)
+        self.assertEqual(counts.get("beta"), 2)
+
+    # === Gap 9: ls count after rep overwrite must be 1 ===
+
+    def test_ls_counts_rep_as_one(self):
+        """After two rep-mode out calls, ls must report count=1 for that name."""
+        linda.out("singleton", "v1", mode="rep")
+        linda.out("singleton", "v2", mode="rep")
+        counts = {e.split()[1]: int(e.split()[0]) for e in linda.ls()}
+        self.assertEqual(counts.get("singleton"), 1)
 
     def test_mixed_semantics_warning(self):
         """Test that mixing normal and replacement semantics works as documented."""

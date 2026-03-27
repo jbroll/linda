@@ -142,4 +142,61 @@ else
     Pass
 fi
 
+# === Test 13: Concurrent inp — exactly one wins ===
+Test "Concurrent inp: exactly one consumer wins a single tuple"
+# Start two blocking consumers before the tuple exists
+$LINDA inp concrace 3 > /tmp/linda_c1.out 2>/dev/null &
+pid1=$!
+$LINDA inp concrace 3 > /tmp/linda_c2.out 2>/dev/null &
+pid2=$!
+sleep 0.1   # let both settle into their wait loop
+echo "prize" | $LINDA out concrace
+wait $pid1; rc1=$?
+wait $pid2; rc2=$?
+got1=$(cat /tmp/linda_c1.out 2>/dev/null)
+got2=$(cat /tmp/linda_c2.out 2>/dev/null)
+rm -f /tmp/linda_c1.out /tmp/linda_c2.out
+if [[ ("$got1" = "prize" && -z "$got2") || ("$got2" = "prize" && -z "$got1") ]]; then
+    Pass
+else
+    Fail
+fi
+
+# === Test 14: Stale lock from dead process is recovered ===
+Test "Stale lock file from dead process is cleaned up"
+echo "staledata" | $LINDA out staletest
+tuplefile=$(ls "$TUPPLEDIR"/staletest* 2>/dev/null | grep -v '\.lock$' | head -1)
+echo "999999999" > "${tuplefile}.lock"
+result=$($LINDA inp staletest once)
+CompareArgs "$result" "staledata"
+
+# === Test 15: seq + rep together — both effects apply ===
+Test "out with seq and rep: sequence number present, random hex absent"
+$LINDA clear
+echo "data" | $LINDA out seqrep seq rep
+file=$(ls "$TUPPLEDIR"/seqrep* 2>/dev/null | grep -v '\.lock$' | head -1)
+base=$(basename "$file")
+# Filename must be: seqrep-NNNNNNNN (no second hex segment, no expiry suffix)
+if [[ "$base" =~ ^seqrep-[0-9]{8}$ ]]; then Pass; else echo "got: $base" >&2; Fail; fi
+
+# === Test 16: ls count numerical accuracy ===
+Test "ls counts are numerically accurate"
+$LINDA clear
+echo "x" | $LINDA out alpha
+echo "x" | $LINDA out alpha
+echo "x" | $LINDA out alpha
+echo "y" | $LINDA out beta
+echo "y" | $LINDA out beta
+alpha_count=$($LINDA ls | awk '$2=="alpha"{print $1}')
+beta_count=$($LINDA ls | awk '$2=="beta"{print $1}')
+CompareArgs "$alpha_count" "3" "$beta_count" "2"
+
+# === Test 17: ls count after rep overwrite must be 1 ===
+Test "ls reports count=1 after two rep-mode writes"
+$LINDA clear
+echo "v1" | $LINDA out singleton rep
+echo "v2" | $LINDA out singleton rep
+count=$($LINDA ls | awk '$2=="singleton"{print $1}')
+CompareArgs "$count" "1"
+
 TestDone
