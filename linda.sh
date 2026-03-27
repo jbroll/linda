@@ -52,10 +52,17 @@ fileunlock() {
 }
 
 clean_expired() {
-    for f in "$TUPPLEDIR"/*.*; do
-        local expires="${f##*.}"
-        if [[ "$expires" =~ ^[0-9]+$ ]]; then
-            if [[ "$expires" -le $(date +%s) ]]; then
+    local now
+    now=$(date +%s)
+    for f in "$TUPPLEDIR"/*; do
+        local base expires
+        base=$(basename "$f")
+        # Only treat the final component as an expiry if it looks like a
+        # plausible Unix timestamp (10 digits), avoiding false matches on
+        # rep-mode tuples whose name contains a short numeric suffix.
+        if [[ "$base" =~ \.([0-9]{10,})$ ]]; then
+            expires="${BASH_REMATCH[1]}"
+            if [[ "$expires" -le "$now" ]]; then
                 rm -f "$f"
             fi
         fi
@@ -75,9 +82,10 @@ next_seq() {
     if [ -f "$seqfile" ]; then
         seq=$(< "$seqfile")
     fi
-    printf "%08d" $((10#$seq + 1)) > "$seqfile"
+    seq=$(( 10#$seq + 1 ))
+    printf "%08d" "$seq" > "$seqfile"
     fileunlock "$seqfile"
-    printf -- "-%08d" $((10#$seq))
+    printf -- "-%08d" "$seq"
 }
 
 hex() {
@@ -165,7 +173,7 @@ _wait_for_tuple() {
                 return 1
             fi
         fi
-        sleep 0.1
+        sleep 0.5
     done
 }
 
